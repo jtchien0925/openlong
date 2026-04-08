@@ -199,6 +199,12 @@ If you use OpenLong in your research, please cite the original paper:
 
 ---
 
+## Author
+
+**JT Chien** is the founder of **JT Chien Studio**, an AI systems implementation consultancy based in Atlanta, working globally. He is Managing Director at String Capital, Board Member at GeoSynergy Group, and Visiting Professor in Computer Science at Emory University.
+
+---
+
 ## License
 
 [AGPL v3](LICENSE) — free for academic and open-source use. [Commercial licenses](COMMERCIAL_LICENSE.md) available for proprietary integration.
