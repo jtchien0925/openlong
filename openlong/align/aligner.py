@@ -127,17 +127,49 @@ def align_to_reference(
     return read_bam(output_bam, min_length=0)
 
 
+def _parse_cigar_string(cigar_str: str) -> list[tuple[int, int]]:
+    """Convert CIGAR string to list of (operation, length) tuples.
+
+    Uses pysam convention: M=0, I=1, D=2, N=3, S=4, H=5, =7, X=8
+
+    Args:
+        cigar_str: CIGAR string like "100M2I50M3D20M"
+
+    Returns:
+        List of (operation_code, length) tuples.
+    """
+    if not cigar_str:
+        return []
+
+    op_map = {"M": 0, "I": 1, "D": 2, "N": 3, "S": 4, "H": 5, "=": 7, "X": 8}
+    cigar_tuples = []
+
+    i = 0
+    current_len = ""
+    while i < len(cigar_str):
+        if cigar_str[i].isdigit():
+            current_len += cigar_str[i]
+        else:
+            op_char = cigar_str[i]
+            if op_char in op_map and current_len:
+                cigar_tuples.append((op_map[op_char], int(current_len)))
+                current_len = ""
+        i += 1
+
+    return cigar_tuples
+
+
 def build_msa_matrix(
     reads: ReadCollection,
     reference_seq: str,
     region_start: int = 0,
     region_end: int | None = None,
-) -> tuple[np.ndarray, list[str]]:
+) -> tuple[np.ndarray, list[str], np.ndarray]:
     """Build a multiple sequence alignment matrix from aligned reads.
 
     This generates the alignment view described in Dilernia et al. 2015:
     each read becomes a row vector where elements are aligned to the
-    reference positions.
+    reference positions. Uses CIGAR string parsing for proper indel handling.
 
     Args:
         reads: Aligned ReadCollection.
@@ -146,8 +178,10 @@ def build_msa_matrix(
         region_end: End position in reference.
 
     Returns:
-        Tuple of (MSA matrix as numpy uint8 array, list of read names).
-        Matrix encoding: A=1, C=2, G=3, T=4, gap=0, N=5
+        Tuple of (MSA matrix, list of read names, ref_to_msa coordinate mapping).
+        MSA is a numpy uint8 array with encoding: A=1, C=2, G=3, T=4, gap=0, N=5.
+        ref_to_msa is a 1D array of length (region_end - region_start) mapping
+        reference positions to MSA column indices.
     """
     if region_end is None:
         region_end = len(reference_seq)
@@ -166,7 +200,12 @@ def build_msa_matrix(
 
     if not aligned_reads:
         logger.warning("No reads overlap the specified region")
-        return np.zeros((0, ref_len), dtype=np.uint8), []
+        # Return empty MSA, empty read names, and identity mapping for ref_to_msa
+        return (
+            np.zeros((0, ref_len), dtype=np.uint8),
+            [],
+            np.arange(ref_len, dtype=np.int32),
+        )
 
     n_reads = len(aligned_reads)
     msa = np.zeros((n_reads, ref_len), dtype=np.uint8)
@@ -176,8 +215,21 @@ def build_msa_matrix(
         read_names.append(read.name)
         seq = read.sequence.upper()
 
-        # Simple pairwise alignment projection onto reference coordinates
-        # In production, this would parse the CIGAR string properly
+        # Try to use CIGAR parsing if available, fall back to simple method
+        if read.cigar:
+            cigar_tuples = _parse_cigar_string(read.cigar)
+            if cigar_tuples:
+                aligned_row = parse_cigar_to_alignment(
+                    cigar_tuples,
+                    seq,
+                    read.reference_start,
+                    region_end,
+                )
+                # Extract the region of interest
+                msa[i, :] = aligned_row[region_start:region_end]
+                continue
+
+        # Fallback: simple pairwise alignment projection onto reference coordinates
         read_offset = max(0, region_start - read.reference_start)
         ref_offset = max(0, read.reference_start - region_start)
 
@@ -190,11 +242,15 @@ def build_msa_matrix(
             base = seq[read_offset + j] if (read_offset + j) < len(seq) else "-"
             msa[i, ref_offset + j] = base_map.get(base, 0)
 
+    # Build ref_to_msa coordinate mapping (for ungapped alignment, this is identity)
+    # In future, if insertions are added to MSA, this would map to actual column indices
+    ref_to_msa = np.arange(ref_len, dtype=np.int32)
+
     logger.info(
         f"Built MSA matrix: {n_reads} reads x {ref_len} positions "
         f"(region {region_start}-{region_end})"
     )
-    return msa, read_names
+    return msa, read_names, ref_to_msa
 
 
 def parse_cigar_to_alignment(

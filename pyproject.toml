@@ -13,6 +13,9 @@ authors = [
     {name = "OpenLong Contributors"}
 ]
 keywords = ["bioinformatics", "long-read", "sequencing", "PacBio", "nanopore", "haplotype", "variant-calling"]
+# System dependencies: minimap2 and samtools must be installed separately
+# Install with: apt-get install minimap2 samtools (Debian/Ubuntu)
+#              brew install minimap2 samtools (macOS)
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",

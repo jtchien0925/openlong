@@ -30,12 +30,46 @@ logger = logging.getLogger(__name__)
 GAP = 0
 
 # Platform-specific residual error rates (after INDEL correction)
+# These defaults can be modified at runtime using set_error_rate()
 PLATFORM_ERROR_RATES = {
     "pacbio_clr": 0.02,   # ~2% residual after correction
     "pacbio_hifi": 0.001,  # ~0.1% for HiFi reads
     "ont": 0.03,           # ~3% for ONT R10
     "unknown": 0.02,
 }
+
+
+def set_error_rate(platform: str, rate: float) -> None:
+    """Set the error rate for a sequencing platform.
+
+    Allows runtime configuration of platform-specific error rates.
+
+    Args:
+        platform: Platform name (e.g., 'pacbio_clr', 'pacbio_hifi', 'ont').
+        rate: Error rate as a float between 0 and 1.
+
+    Raises:
+        ValueError: If rate is not between 0 and 1.
+    """
+    if not 0 <= rate <= 1:
+        raise ValueError(f"Error rate must be between 0 and 1, got {rate}")
+    PLATFORM_ERROR_RATES[platform] = rate
+    logger.info(f"Set error rate for '{platform}' to {rate}")
+
+
+def get_error_rate(platform: str) -> float:
+    """Get the error rate for a sequencing platform.
+
+    Retrieves the configured error rate for the given platform,
+    falling back to 'unknown' if the platform is not found.
+
+    Args:
+        platform: Platform name (e.g., 'pacbio_clr', 'pacbio_hifi', 'ont').
+
+    Returns:
+        Error rate as a float.
+    """
+    return PLATFORM_ERROR_RATES.get(platform, PLATFORM_ERROR_RATES["unknown"])
 
 
 @dataclass
@@ -81,7 +115,7 @@ def identify_variant_positions(
     Returns:
         List of VariantPosition objects for significant positions.
     """
-    error_rate = custom_error_rate or PLATFORM_ERROR_RATES.get(platform, 0.02)
+    error_rate = custom_error_rate or get_error_rate(platform)
     n_reads, n_positions = msa.shape
     main_indices = np.where(is_main)[0]
 

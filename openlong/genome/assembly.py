@@ -7,6 +7,7 @@ assembly, and integration with standard genome assembly tools.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import subprocess
@@ -14,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +36,11 @@ class GenomeRegion:
     size: int = 0
 
     def __post_init__(self):
+        """Compute the size of the region."""
         self.size = self.end - self.start
 
     def __str__(self):
+        """Return a string representation in the format chrom:start-end."""
         return f"{self.chrom}:{self.start}-{self.end}"
 
 
@@ -151,7 +155,7 @@ def process_region(
         return AssemblyResult(region=region)
 
     # 3. Build MSA
-    msa, read_names = build_msa_matrix(
+    msa, read_names, ref_to_msa = build_msa_matrix(
         reads, region_ref, region_start=region.start, region_end=region.end
     )
 
@@ -246,12 +250,52 @@ def run_genome_assembly(
     )
 
     results = []
-    for i, region in enumerate(regions):
-        logger.info(f"Processing region {i + 1}/{len(regions)}: {region}")
-        result = process_region(
-            region, bam_path, reference_path, output_dir, pipeline_config
-        )
-        results.append(result)
+
+    # Use sequential processing if threads=1, otherwise use ProcessPoolExecutor
+    if threads == 1:
+        for i, region in enumerate(regions):
+            logger.info(f"Processing region {i + 1}/{len(regions)}: {region}")
+            result = process_region(
+                region, bam_path, reference_path, output_dir, pipeline_config
+            )
+            results.append(result)
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as executor:
+            # Submit all regions as futures
+            futures = {
+                executor.submit(
+                    process_region,
+                    region,
+                    bam_path,
+                    reference_path,
+                    output_dir,
+                    pipeline_config,
+                ): (i, region)
+                for i, region in enumerate(regions)
+            }
+
+            # Collect results as they complete with progress tracking
+            completed_count = 0
+            for future in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc="Genome assembly progress",
+            ):
+                i, region = futures[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    completed_count += 1
+                    logger.info(
+                        f"Processed region {completed_count}/{len(regions)}: {region}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error processing region {i + 1}/{len(regions)} ({region}): {e}",
+                        exc_info=True,
+                    )
+                    # Continue processing other regions even if one fails
+                    results.append(AssemblyResult(region=region))
 
     # Summary
     total_variants = sum(r.variants_called for r in results)

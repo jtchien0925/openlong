@@ -37,6 +37,7 @@ def phase_variants(
     msa: np.ndarray,
     is_main: np.ndarray,
     chrom: str = "chr1",
+    ref_to_msa: np.ndarray | None = None,
 ) -> list[PhasedBlock]:
     """Phase variants into haplotype blocks using cluster assignments.
 
@@ -50,6 +51,8 @@ def phase_variants(
         msa: Full corrected MSA matrix.
         is_main: Position classification.
         chrom: Chromosome name.
+        ref_to_msa: Coordinate mapping array from reference positions to MSA columns.
+                    If None, falls back to approximate mapping (pos - 1).
 
     Returns:
         List of PhasedBlock objects.
@@ -69,8 +72,17 @@ def phase_variants(
         pos = var.get("pos", 0)
         alt_base = var.get("alt", "")
 
-        # Map VCF position to MSA column index
-        msa_col = pos - 1  # Approximate; in production needs proper coordinate mapping
+        # Map VCF position to MSA column index using coordinate mapping if available
+        if ref_to_msa is not None:
+            # Use proper coordinate mapping with bounds checking
+            if 0 <= pos < len(ref_to_msa):
+                msa_col = ref_to_msa[pos]
+            else:
+                continue
+        else:
+            # Fallback: approximate 1:1 mapping (backwards compatibility)
+            msa_col = pos - 1
+
         if msa_col < 0 or msa_col >= msa.shape[1]:
             continue
 

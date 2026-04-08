@@ -131,3 +131,67 @@ def write_report(
         json.dump(stats, fh, indent=2, default=str)
 
     logger.info(f"Wrote report to {filepath}")
+
+
+def write_json_results(
+    results: dict,
+    output_path: str | Path,
+    stage: str = "pipeline",
+) -> None:
+    """Write structured JSON results for agent consumption.
+
+    Every pipeline stage can emit a JSON file that AI agents
+    can parse directly without regex or text parsing.
+
+    Args:
+        results: Dictionary of results from a pipeline stage.
+        output_path: Output path for JSON file.
+        stage: Name of the pipeline stage that produced this output.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import openlong
+    version = getattr(openlong, "__version__", "0.1.0")
+
+    output_data = {
+        "stage": stage,
+        "timestamp": datetime.now().isoformat(),
+        "version": version,
+        "results": results,
+        "metadata": {
+            "agent_native": True,
+            "format_version": "1.0",
+        },
+    }
+
+    with open(output_path, "w") as fh:
+        json.dump(output_data, fh, indent=2, default=str)
+
+    logger.info(f"Wrote {stage} JSON results to {output_path}")
+
+
+def write_stage_json(
+    stage_name: str,
+    data: dict,
+    output_dir: Path,
+) -> Path:
+    """Write per-stage JSON output file.
+
+    Convenience function for writing per-stage JSON during pipeline execution.
+
+    Args:
+        stage_name: Name of the pipeline stage.
+        data: Stage output data.
+        output_dir: Output directory.
+
+    Returns:
+        Path to the written JSON file.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = output_dir / f"{stage_name}.json"
+    write_json_results(data, output_path, stage=stage_name)
+
+    return output_path

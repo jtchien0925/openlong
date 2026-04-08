@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,87 @@ class PipelineResults:
     output_files: list[str] = field(default_factory=list)
 
 
+def _validate_inputs(config: PipelineConfig) -> None:
+    """Validate pipeline inputs before running.
+
+    Args:
+        config: Pipeline configuration to validate.
+
+    Raises:
+        ValueError: If validation fails with a helpful error message.
+    """
+    input_path = Path(config.input_path)
+
+    # Check input_path exists and is readable
+    if not input_path.exists():
+        raise ValueError(
+            f"Input file/directory not found: {config.input_path}\n"
+            f"Please provide a valid path to a BAM, FASTQ, or FASTA file."
+        )
+
+    # Check input_path has supported extension
+    suffix = input_path.suffix.lower()
+    if suffix == ".gz":
+        # For gzipped files, check the stem extension
+        stem_suffix = Path(input_path.stem).suffix.lower()
+        supported = {".bam", ".fastq", ".fq", ".fasta", ".fa"}
+        if stem_suffix not in supported:
+            raise ValueError(
+                f"Unsupported input file extension: {input_path}\n"
+                f"Supported extensions: .bam, .fastq, .fq, .fasta, .fa, "
+                f"and their .gz variants"
+            )
+    else:
+        supported = {".bam", ".fastq", ".fq", ".fasta", ".fa"}
+        if suffix not in supported:
+            raise ValueError(
+                f"Unsupported input file extension: {input_path}\n"
+                f"Supported extensions: .bam, .fastq, .fq, .fasta, .fa, "
+                f"and their .gz variants"
+            )
+
+    # Check reference_path if provided
+    if config.reference_path:
+        ref_path = Path(config.reference_path)
+        if not ref_path.exists():
+            raise ValueError(
+                f"Reference file not found: {config.reference_path}\n"
+                f"Please provide a valid path to a FASTA reference."
+            )
+
+        # Check reference has supported extension
+        ref_suffix = ref_path.suffix.lower()
+        if ref_suffix == ".gz":
+            ref_stem_suffix = Path(ref_path.stem).suffix.lower()
+            ref_supported = {".fasta", ".fa"}
+            if ref_stem_suffix not in ref_supported:
+                raise ValueError(
+                    f"Unsupported reference file extension: {config.reference_path}\n"
+                    f"Supported extensions: .fasta, .fa, and their .gz variants"
+                )
+        else:
+            ref_supported = {".fasta", ".fa"}
+            if ref_suffix not in ref_supported:
+                raise ValueError(
+                    f"Unsupported reference file extension: {config.reference_path}\n"
+                    f"Supported extensions: .fasta, .fa, and their .gz variants"
+                )
+
+    # Check output_dir parent exists or can be created
+    output_path = Path(config.output_dir)
+    parent = output_path.parent
+
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            raise ValueError(
+                f"Cannot create output directory parent: {parent}\n"
+                f"Error: {e}\n"
+                f"Please ensure you have write permissions."
+            )
+
+
 def run_pipeline(config: PipelineConfig) -> PipelineResults:
     """Run the full OpenLong pipeline.
 
@@ -115,6 +197,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
     from openlong.deconv.consensus import build_all_consensus, export_haplotypes
     from openlong.variants.snv import call_snvs_multi_haplotype
     from openlong.variants.sv import detect_deletions, detect_insertions
+
+    # Validate inputs before proceeding
+    _validate_inputs(config)
 
     start_time = time.time()
     output_dir = Path(config.output_dir)
@@ -165,8 +250,22 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
     # === STANDARD MODE (viral / targeted) ===
     logger.info("Running in standard mode")
 
+    # Initialize progress bar for pipeline stages
+    stages = [
+        "load",
+        "align",
+        "msa",
+        "correct",
+        "variants",
+        "cluster",
+        "consensus",
+        "call",
+    ]
+    pbar = tqdm(stages, desc="OpenLong Pipeline", unit="stage")
+
     # Step 1: Load reads
     logger.info("Step 1: Loading reads")
+    pbar.set_postfix({"status": "loading reads"})
     input_path = Path(config.input_path)
 
     if input_path.suffix == ".bam":
@@ -191,7 +290,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
         logger.error(
             f"Insufficient reads: {len(reads.reads)} < {config.min_coverage}"
         )
+        pbar.close()
         return results
+
+    pbar.update(1)
+    pbar.set_postfix({"reads": len(reads.reads), "bases": reads.total_bases})
 
     # Step 2: Align to reference (if reference provided and reads not aligned)
     needs_alignment = config.reference_path and any(
@@ -200,6 +303,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
 
     if needs_alignment:
         logger.info("Step 2: Aligning to reference")
+        pbar.set_postfix({"status": "aligning"})
         aligned_bam = output_dir / "aligned.bam"
         reads = align_to_reference(
             reads,
@@ -211,6 +315,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
         results.output_files.append(str(aligned_bam))
     else:
         logger.info("Step 2: Reads already aligned, skipping")
+
+    pbar.update(1)
+    pbar.set_postfix({"status": "building MSA"})
 
     # Step 3: Build MSA
     logger.info("Step 3: Building MSA")
@@ -230,15 +337,20 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
         reference_seq = longest.sequence
         logger.info(f"Using longest read as pseudo-reference ({longest.read_length} bp)")
 
-    msa, read_names = build_msa_matrix(reads, reference_seq)
+    msa, read_names, ref_to_msa = build_msa_matrix(reads, reference_seq)
     results.stats["msa_shape"] = list(msa.shape)
 
     if msa.shape[0] < 2:
         logger.error("MSA has fewer than 2 reads")
+        pbar.close()
         return results
+
+    pbar.update(1)
+    pbar.set_postfix({"msa_shape": f"{msa.shape[0]}x{msa.shape[1]}"})
 
     # Step 4: INDEL correction
     logger.info("Step 4: INDEL correction")
+    pbar.set_postfix({"status": "INDEL correction"})
     corrected_msa, correction_stats = iterative_indel_correction(
         msa,
         max_iterations=config.max_correction_iterations,
@@ -248,8 +360,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
     results.stats["correction_iterations"] = len(correction_stats)
     results.stats["total_corrections"] = sum(s.corrections_made for s in correction_stats)
 
+    pbar.update(1)
+    pbar.set_postfix({"corrections": results.stats["total_corrections"]})
+
     # Step 5: Identify variant positions
     logger.info("Step 5: Identifying variant positions")
+    pbar.set_postfix({"status": "identifying variants"})
     is_main = classify_positions(corrected_msa, config.occupancy_threshold)
     variant_positions = identify_variant_positions(
         corrected_msa,
@@ -263,8 +379,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
     results.stats["variant_positions"] = len(variant_positions)
     results.stats["main_positions"] = int(np.sum(is_main))
 
+    pbar.update(1)
+    pbar.set_postfix({"variant_positions": len(variant_positions)})
+
     # Step 6: Cluster reads
     logger.info("Step 6: Clustering reads into haplotypes")
+    pbar.set_postfix({"status": "clustering"})
     variant_matrix = build_variant_matrix(corrected_msa, variant_positions)
 
     if config.max_deconv_depth > 1 and len(variant_positions) > 0:
@@ -295,8 +415,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
     freqs = estimate_haplotype_frequencies(clusters)
     results.stats["haplotype_frequencies"] = freqs
 
+    pbar.update(1)
+    pbar.set_postfix({"haplotypes": len(clusters)})
+
     # Step 7: Build consensus
     logger.info("Step 7: Building haplotype consensus sequences")
+    pbar.set_postfix({"status": "building consensus"})
     clusters = build_all_consensus(
         corrected_msa,
         clusters,
@@ -309,8 +433,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
         c.cluster_id: c.mean_qv for c in clusters
     }
 
+    pbar.update(1)
+    pbar.set_postfix({"consensus_quality": f"{np.mean(list(results.stats['consensus_qualities'].values())):.1f}"})
+
     # Step 8: Call variants
     logger.info("Step 8: Calling variants")
+    pbar.set_postfix({"status": "calling variants"})
     if reference_seq:
         qualities_dict = {
             name: cluster.quality
@@ -333,6 +461,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineResults:
         results.variants = snvs + sv_variants
         results.stats["snvs"] = len(snvs)
         results.stats["svs"] = len(sv_variants)
+
+    pbar.update(1)
+    pbar.set_postfix({"snvs": results.stats.get("snvs", 0), "svs": results.stats.get("svs", 0)})
+    pbar.close()
 
     # Write outputs
     elapsed = time.time() - start_time
