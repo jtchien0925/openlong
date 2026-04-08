@@ -191,21 +191,29 @@ def correct_indels(
 
 def iterative_indel_correction(
     msa: np.ndarray,
-    max_iterations: int = 3,
+    max_iterations: int = 5,
     occupancy_threshold: float = 0.5,
-    convergence_threshold: float = 0.01,
+    convergence_threshold: float = 0.001,
 ) -> tuple[np.ndarray, list[CorrectionStats]]:
     """Apply INDEL correction iteratively until convergence.
 
     The paper describes iterative refinement where after each correction
-    pass, the consensus is updated and positions are reclassified.
+    pass, positions are **re-classified** (occupancies change after masking)
+    and correction is applied again. This is critical because:
+    1. First pass corrects the most obvious artifacts
+    2. Re-classification may reclassify borderline positions
+    3. Second pass catches artifacts exposed by the first correction
+
+    Convergence threshold is set tight (0.1% of elements) to ensure
+    thorough correction on real data. The original 1% was too loose
+    and caused premature convergence after a single iteration.
 
     Args:
         msa: Input MSA matrix.
         max_iterations: Maximum number of correction iterations.
         occupancy_threshold: Position classification threshold.
         convergence_threshold: Stop if fraction of new corrections
-            drops below this.
+            drops below this (default 0.001 = 0.1% of elements).
 
     Returns:
         Tuple of (final corrected MSA, list of stats per iteration).
@@ -214,7 +222,14 @@ def iterative_indel_correction(
     all_stats = []
 
     for iteration in range(max_iterations):
-        corrected, stats = correct_indels(current, occupancy_threshold=occupancy_threshold)
+        # Re-classify positions each iteration — this is the key insight
+        # from the paper. After corrections, occupancies shift and some
+        # positions that were borderline INDEL may become clearly main
+        # or vice versa.
+        is_main = classify_positions(current, occupancy_threshold)
+        corrected, stats = correct_indels(
+            current, is_main=is_main, occupancy_threshold=occupancy_threshold
+        )
         all_stats.append(stats)
 
         total_elements = current.shape[0] * current.shape[1]
@@ -222,7 +237,8 @@ def iterative_indel_correction(
 
         logger.info(
             f"Iteration {iteration + 1}: {stats.corrections_made} corrections "
-            f"({correction_fraction:.4%} of elements)"
+            f"({correction_fraction:.4%} of elements), "
+            f"{stats.main_positions} main / {stats.indel_positions} INDEL positions"
         )
 
         if correction_fraction < convergence_threshold:

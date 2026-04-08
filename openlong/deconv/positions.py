@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 from scipy import stats as sp_stats
@@ -31,11 +32,14 @@ GAP = 0
 
 # Platform-specific residual error rates (after INDEL correction)
 # These defaults can be modified at runtime using set_error_rate()
+# NOTE: CLR rates must account for residual INDEL artifacts that survive
+# correction plus substitution-like errors from misalignment. The original
+# 2% was calibrated on synthetic data and is too optimistic for real reads.
 PLATFORM_ERROR_RATES = {
-    "pacbio_clr": 0.02,   # ~2% residual after correction
-    "pacbio_hifi": 0.001,  # ~0.1% for HiFi reads
-    "ont": 0.03,           # ~3% for ONT R10
-    "unknown": 0.02,
+    "pacbio_clr": 0.08,   # ~8% residual after correction (real CLR data)
+    "pacbio_hifi": 0.005,  # ~0.5% for HiFi reads (conservative)
+    "ont": 0.06,           # ~6% for ONT R10 (real ONT data)
+    "unknown": 0.08,
 }
 
 
@@ -72,6 +76,14 @@ def get_error_rate(platform: str) -> float:
     return PLATFORM_ERROR_RATES.get(platform, PLATFORM_ERROR_RATES["unknown"])
 
 
+class StrandBiasInfo(NamedTuple):
+    """Strand bias test results for a variant position."""
+
+    forward_count: int
+    reverse_count: int
+    bias_pvalue: float
+
+
 @dataclass
 class VariantPosition:
     """A position identified as truly polymorphic."""
@@ -85,6 +97,7 @@ class VariantPosition:
     p_value: float
     q_value: float  # FDR-adjusted
     entropy: float
+    strand_bias: StrandBiasInfo | None = None  # Optional strand bias info
 
 
 def identify_variant_positions(
@@ -94,14 +107,23 @@ def identify_variant_positions(
     fdr_threshold: float = 0.05,
     min_coverage: int = 5,
     min_minor_count: int = 2,
+    min_minor_freq: float = 0.0,
+    min_entropy: float = 0.0,
     custom_error_rate: float | None = None,
 ) -> list[VariantPosition]:
     """Identify true variant positions using statistical testing.
 
     For each main position in the corrected MSA:
     1. Compute allele frequencies
-    2. Test if minor allele frequency exceeds error rate
-    3. Correct for multiple testing
+    2. Apply minimum minor allele frequency (MAF) filter
+    3. Test if minor allele frequency exceeds error rate (binomial test)
+    4. Correct for multiple testing (Benjamini-Hochberg FDR)
+    5. Apply minimum Shannon entropy filter
+
+    The MAF and entropy filters are critical for real sequencing data
+    where residual errors can pass the binomial test at many positions.
+    True biological variant positions have higher MAF and entropy than
+    noise positions — these filters exploit that separation.
 
     Args:
         msa: Corrected MSA matrix (n_reads x n_positions).
@@ -110,6 +132,10 @@ def identify_variant_positions(
         fdr_threshold: FDR threshold for significance.
         min_coverage: Minimum read depth at a position.
         min_minor_count: Minimum minor allele count.
+        min_minor_freq: Minimum minor allele frequency. If 0, auto-set
+            from platform: CLR=0.10, HiFi=0.02, ONT=0.10.
+        min_entropy: Minimum Shannon entropy. If 0, auto-set from
+            platform: CLR=0.40, HiFi=0.10, ONT=0.40.
         custom_error_rate: Override platform error rate.
 
     Returns:
@@ -119,9 +145,29 @@ def identify_variant_positions(
     n_reads, n_positions = msa.shape
     main_indices = np.where(is_main)[0]
 
+    # Auto-set MAF and entropy thresholds based on platform noise floor
+    if min_minor_freq == 0.0:
+        _maf_defaults = {
+            "pacbio_clr": 0.10,
+            "pacbio_hifi": 0.02,
+            "ont": 0.10,
+            "unknown": 0.10,
+        }
+        min_minor_freq = _maf_defaults.get(platform, 0.10)
+
+    if min_entropy == 0.0:
+        _entropy_defaults = {
+            "pacbio_clr": 0.40,
+            "pacbio_hifi": 0.10,
+            "ont": 0.40,
+            "unknown": 0.40,
+        }
+        min_entropy = _entropy_defaults.get(platform, 0.40)
+
     logger.info(
         f"Testing {len(main_indices)} main positions for true variants "
-        f"(error_rate={error_rate}, FDR={fdr_threshold})"
+        f"(error_rate={error_rate}, FDR={fdr_threshold}, "
+        f"min_MAF={min_minor_freq}, min_entropy={min_entropy})"
     )
 
     candidates = []
@@ -161,6 +207,20 @@ def identify_variant_positions(
         if not minor_alleles:
             continue
 
+        # --- FILTER 1: Minimum minor allele frequency ---
+        overall_maf = minor_total / total
+        if overall_maf < min_minor_freq:
+            continue
+
+        # Compute entropy
+        freqs = counts / total
+        freqs = freqs[freqs > 0]
+        entropy = -np.sum(freqs * np.log2(freqs))
+
+        # --- FILTER 2: Minimum Shannon entropy ---
+        if entropy < min_entropy:
+            continue
+
         # Binomial test: is the minor allele count significantly
         # higher than expected from sequencing error alone?
         # H0: minor_total arose from errors at rate `error_rate`
@@ -169,11 +229,6 @@ def identify_variant_positions(
         ) if hasattr(sp_stats, 'binom_test') else sp_stats.binomtest(
             minor_total, total, error_rate, alternative="greater"
         ).pvalue
-
-        # Compute entropy
-        freqs = counts / total
-        freqs = freqs[freqs > 0]
-        entropy = -np.sum(freqs * np.log2(freqs))
 
         candidates.append(
             VariantPosition(

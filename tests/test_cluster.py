@@ -7,6 +7,7 @@ from openlong.correct.indel import BASE_A, BASE_C, BASE_G, BASE_T
 from openlong.deconv.cluster import (
     hamming_distance_matrix,
     cluster_reads_hierarchical,
+    estimate_n_clusters,
     estimate_haplotype_frequencies,
     HaplotypeCluster,
 )
@@ -15,41 +16,46 @@ from openlong.deconv.cluster import (
 class TestHammingDistance:
     def test_identical_reads(self):
         """Identical reads should have zero distance."""
-        vm = np.array([
-            [BASE_A, BASE_C, BASE_G],
-            [BASE_A, BASE_C, BASE_G],
-        ], dtype=np.uint8)
-        dist = hamming_distance_matrix(vm)
+        vm = np.tile([BASE_A, BASE_C, BASE_G, BASE_T, BASE_A,
+                      BASE_C, BASE_G, BASE_T, BASE_A, BASE_C], (2, 1)).astype(np.uint8)
+        dist = hamming_distance_matrix(vm, min_shared_positions=1)
         assert dist[0, 1] == 0.0
         assert dist[1, 0] == 0.0
 
     def test_completely_different(self):
         """Completely different reads should have distance 1.0."""
         vm = np.array([
-            [BASE_A, BASE_A, BASE_A],
-            [BASE_C, BASE_C, BASE_C],
+            [BASE_A] * 10,
+            [BASE_C] * 10,
         ], dtype=np.uint8)
-        dist = hamming_distance_matrix(vm)
+        dist = hamming_distance_matrix(vm, min_shared_positions=1)
         assert dist[0, 1] == 1.0
 
     def test_partial_difference(self):
         """One mismatch in 3 positions = 1/3 distance."""
-        vm = np.array([
-            [BASE_A, BASE_C, BASE_G],
-            [BASE_A, BASE_C, BASE_T],  # Only last differs
-        ], dtype=np.uint8)
-        dist = hamming_distance_matrix(vm)
+        row1 = [BASE_A, BASE_C, BASE_G]
+        row2 = [BASE_A, BASE_C, BASE_T]  # Only last differs
+        vm = np.array([row1, row2], dtype=np.uint8)
+        dist = hamming_distance_matrix(vm, min_shared_positions=1)
         assert pytest.approx(dist[0, 1], abs=0.01) == 1 / 3
 
     def test_gaps_ignored(self):
         """Gap positions should be excluded from distance."""
-        vm = np.array([
-            [BASE_A, 0, BASE_G],
-            [BASE_A, BASE_C, BASE_G],
-        ], dtype=np.uint8)
-        dist = hamming_distance_matrix(vm, ignore_gaps=True)
-        # Only positions 0 and 2 compared (both match)
+        row1 = [BASE_A, 0, BASE_G] + [BASE_A] * 7
+        row2 = [BASE_A, BASE_C, BASE_G] + [BASE_A] * 7
+        vm = np.array([row1, row2], dtype=np.uint8)
+        dist = hamming_distance_matrix(vm, ignore_gaps=True, min_shared_positions=1)
+        # Only non-gap positions compared (all match)
         assert dist[0, 1] == 0.0
+
+    def test_min_shared_positions(self):
+        """Pairs below min_shared_positions get distance 1.0."""
+        vm = np.array([
+            [BASE_A, 0, 0],
+            [0, BASE_C, 0],
+        ], dtype=np.uint8)
+        dist = hamming_distance_matrix(vm, min_shared_positions=2)
+        assert dist[0, 1] == 1.0  # Only 0 shared positions
 
     def test_symmetric(self):
         """Distance matrix should be symmetric."""
@@ -62,15 +68,15 @@ class TestHammingDistance:
 class TestClusterReads:
     def test_two_clear_clusters(self):
         """Two distinct variant profiles should form two clusters."""
-        # Group 1: AAA
-        # Group 2: CCC
+        # Group 1: all A (10 columns to satisfy min_shared_positions default)
+        # Group 2: all C
         vm = np.array([
-            [BASE_A, BASE_A, BASE_A],
-            [BASE_A, BASE_A, BASE_A],
-            [BASE_A, BASE_A, BASE_A],
-            [BASE_C, BASE_C, BASE_C],
-            [BASE_C, BASE_C, BASE_C],
-            [BASE_C, BASE_C, BASE_C],
+            [BASE_A] * 10,
+            [BASE_A] * 10,
+            [BASE_A] * 10,
+            [BASE_C] * 10,
+            [BASE_C] * 10,
+            [BASE_C] * 10,
         ], dtype=np.uint8)
 
         clusters = cluster_reads_hierarchical(
@@ -80,17 +86,17 @@ class TestClusterReads:
 
     def test_single_group(self):
         """All identical reads should form one cluster."""
-        vm = np.full((10, 5), BASE_A, dtype=np.uint8)
+        vm = np.full((10, 10), BASE_A, dtype=np.uint8)
         clusters = cluster_reads_hierarchical(vm, distance_threshold=0.5)
         assert len(clusters) == 1
 
     def test_minimum_cluster_size(self):
         """Clusters below min size should be dropped."""
         vm = np.array([
-            [BASE_A, BASE_A],
-            [BASE_A, BASE_A],
-            [BASE_A, BASE_A],
-            [BASE_C, BASE_C],  # Only 1 read of this type
+            [BASE_A] * 10,
+            [BASE_A] * 10,
+            [BASE_A] * 10,
+            [BASE_C] * 10,  # Only 1 read of this type
         ], dtype=np.uint8)
 
         clusters = cluster_reads_hierarchical(
