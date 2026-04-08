@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#installation">Install</a> · <a href="#quick-start">Quick Start</a> · <a href="#pipeline-stages">Pipeline</a> · <a href="#supported-platforms">Platforms</a> · <a href="docs/algorithm.md">Algorithm Docs</a> · <a href="LICENSE">MIT License</a>
+  <a href="#installation">Install</a> · <a href="#quick-start">Quick Start</a> · <a href="#pipeline-stages">Pipeline</a> · <a href="#supported-platforms">Platforms</a> · <a href="docs/algorithm.md">Algorithm Docs</a> · <a href="LICENSE">AGPL v3</a> · <a href="COMMERCIAL_LICENSE.md">Commercial License</a>
 </p>
 
 ---
@@ -201,7 +201,7 @@ If you use OpenLong in your research, please cite the original paper:
 
 ## License
 
-[MIT](LICENSE) — free for academic and commercial use.
+[AGPL v3](LICENSE) — free for academic and open-source use. [Commercial licenses](COMMERCIAL_LICENSE.md) available for proprietary integration.
 
 ---
 

@@ -7,7 +7,7 @@ name = "openlong"
 version = "0.1.0"
 description = "Open-source long-read sequencing pipeline for variant deconvolution and haplotype reconstruction"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "AGPL-3.0-or-later"}
 requires-python = ">=3.10"
 authors = [
     {name = "OpenLong Contributors"}
@@ -19,7 +19,7 @@ keywords = ["bioinformatics", "long-read", "sequencing", "PacBio", "nanopore", "
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
