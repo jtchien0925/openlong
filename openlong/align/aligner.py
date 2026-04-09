@@ -167,8 +167,7 @@ def build_msa_matrix(
 ) -> tuple[np.ndarray, list[str], np.ndarray]:
     """Build a multiple sequence alignment matrix from aligned reads.
 
-    This generates the alignment view described in Dilernia et al. 2015:
-    each read becomes a row vector where elements are aligned to the
+    Each read becomes a row vector where elements are aligned to the
     reference positions. Uses CIGAR string parsing for proper indel handling.
 
     Args:

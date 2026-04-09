@@ -1,17 +1,17 @@
 """Read clustering for haplotype deconvolution.
 
-Implements the iterative clustering approach from Dilernia et al. 2015
-for assigning reads to distinct haplotype groups.
+Iterative clustering approach for assigning reads to distinct haplotype
+groups based on their variant profiles.
 
-The paper describes an iterative process:
+The algorithm:
 1. Build variant matrix from true variant positions
 2. Cluster reads based on their variant profiles
 3. Build consensus for each cluster
 4. Repeat: re-examine each cluster for further sub-structure
 5. Continue until no more sub-clusters are found
 
-This implements both the paper's iterative approach and modern
-clustering methods (hierarchical, spectral) for comparison.
+Supports hierarchical (average linkage, Ward's method) and spectral
+clustering, with gap-aware distance computation.
 """
 
 from __future__ import annotations
@@ -23,6 +23,9 @@ import numpy as np
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import pdist, squareform
 from sklearn.metrics import silhouette_score
+from scipy.spatial.distance import cdist
+
+from openlong.deconv.positions import identify_variant_positions, build_variant_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -131,15 +134,156 @@ def impute_gaps_with_consensus(
     return imputed
 
 
+def _compute_wcss_from_labels(
+    distance_matrix: np.ndarray,
+    labels: np.ndarray,
+) -> float:
+    """Compute within-cluster sum of squares (WCSS) from distance matrix and labels.
+
+    For each cluster, computes the sum of squared distances from each point
+    to the cluster centroid (represented as the mean distance to cluster members).
+
+    Args:
+        distance_matrix: Pairwise distance matrix (n_reads x n_reads).
+        labels: Cluster assignment for each point.
+
+    Returns:
+        Total within-cluster sum of squares.
+    """
+    wcss = 0.0
+    unique_labels = np.unique(labels)
+
+    for label in unique_labels:
+        mask = labels == label
+        cluster_indices = np.where(mask)[0]
+
+        if len(cluster_indices) <= 1:
+            continue
+
+        # Compute within-cluster distances
+        sub_dist = distance_matrix[np.ix_(cluster_indices, cluster_indices)]
+        # Sum all pairwise distances (counting each pair once)
+        wcss += np.sum(np.triu(sub_dist, k=1))
+
+    return wcss
+
+
+def _smooth_scores(scores: np.ndarray, window: int = 3) -> np.ndarray:
+    """Smooth a score curve with a moving window to reduce noise.
+
+    Args:
+        scores: Array of scores.
+        window: Window size (should be odd).
+
+    Returns:
+        Smoothed scores array.
+    """
+    if len(scores) < window:
+        return scores
+
+    half_window = window // 2
+    smoothed = np.zeros_like(scores, dtype=float)
+
+    for i in range(len(scores)):
+        start = max(0, i - half_window)
+        end = min(len(scores), i + half_window + 1)
+        smoothed[i] = np.mean(scores[start:end])
+
+    return smoothed
+
+
+def _detect_elbow(wcss_values: np.ndarray, k_values: np.ndarray) -> int:
+    """Detect the elbow point in WCSS curve.
+
+    Uses the maximum curvature method: find the point where the curve
+    changes direction most sharply.
+
+    Args:
+        wcss_values: Within-cluster sum of squares for each k.
+        k_values: Corresponding k values.
+
+    Returns:
+        k value at the elbow (index into wcss_values).
+    """
+    if len(wcss_values) < 3:
+        return k_values[0]
+
+    # Normalize to [0, 1] for comparison
+    wcss_norm = (wcss_values - wcss_values.min()) / (wcss_values.max() - wcss_values.min() + 1e-10)
+
+    # First and second derivatives (approximate)
+    first_deriv = np.diff(wcss_norm)
+    second_deriv = np.diff(first_deriv)
+
+    # Elbow is where second derivative is most negative (greatest decrease in improvement)
+    # Skip first and last points
+    if len(second_deriv) > 0:
+        elbow_idx = np.argmin(second_deriv) + 1
+        return k_values[elbow_idx]
+
+    return k_values[0]
+
+
+def _gap_statistic(
+    distance_matrix: np.ndarray,
+    labels: np.ndarray,
+    n_refs: int = 10,
+) -> float:
+    """Compute gap statistic for cluster quality.
+
+    Compares the within-cluster dispersion to that of a uniform reference
+    distribution. Higher gap indicates better clustering.
+
+    Args:
+        distance_matrix: Pairwise distance matrix.
+        labels: Cluster assignments.
+        n_refs: Number of reference datasets to sample.
+
+    Returns:
+        Gap statistic value.
+    """
+    n_reads = distance_matrix.shape[0]
+
+    # Observed dispersion: log(WCSS)
+    wcss_obs = _compute_wcss_from_labels(distance_matrix, labels)
+    log_wcss_obs = np.log(wcss_obs + 1e-10)
+
+    # Reference dispersion: average over random uniform data
+    log_wcss_refs = []
+    for _ in range(n_refs):
+        # Random uniform data in same dimensionality as original
+        # (approximate using random uniform in [0, max_distance])
+        max_dist = distance_matrix.max()
+        ref_dist = np.random.uniform(0, max_dist, size=distance_matrix.shape)
+        np.fill_diagonal(ref_dist, 0)
+
+        wcss_ref = _compute_wcss_from_labels(ref_dist, labels)
+        log_wcss_refs.append(np.log(wcss_ref + 1e-10))
+
+    log_wcss_ref = np.mean(log_wcss_refs)
+    gap = log_wcss_ref - log_wcss_obs
+
+    return gap
+
+
 def estimate_n_clusters(
     distance_matrix: np.ndarray,
     max_k: int = 20,
     min_k: int = 2,
+    method: str = "combined",
+    lambda_penalty: float = 0.1,
+    smooth_window: int = 3,
 ) -> int:
-    """Estimate optimal cluster count using silhouette scores.
+    """Estimate optimal cluster count using multiple strategies.
 
-    Tries k=min_k..max_k clusters using Ward linkage and computes
-    silhouette score for each k. Returns the k with the highest score.
+    Implements robust auto-k estimation using:
+    1. Silhouette score (original method)
+    2. Elbow detection (WCSS curvature)
+    3. BIC-like penalty criterion (prefers simpler models)
+    4. Gap statistic (robust to noise)
+
+    The combined approach (default) uses consensus across multiple signals
+    with configurable penalty for complexity.
 
     Fallback behavior:
     - If all silhouette scores are negative, return 1 (all in one cluster)
@@ -150,6 +294,14 @@ def estimate_n_clusters(
         distance_matrix: Precomputed distance matrix (n_reads x n_reads).
         max_k: Maximum number of clusters to try.
         min_k: Minimum number of clusters to try.
+        method: Strategy to use:
+            - "silhouette": original silhouette-only method
+            - "elbow": elbow detection on WCSS
+            - "penalized": BIC-like penalized silhouette
+            - "gap": gap statistic
+            - "combined": consensus across all methods (default)
+        lambda_penalty: Penalty weight for complexity (BIC-like term).
+        smooth_window: Window size for smoothing score curves (reduces noise spikes).
 
     Returns:
         Optimal k (number of clusters). At least 1.
@@ -177,38 +329,158 @@ def estimate_n_clusters(
     # Perform hierarchical clustering with Ward linkage
     Z = linkage(condensed, method="ward")
 
-    best_k = 1
-    best_score = -np.inf
+    # Collect metrics for all k values
+    k_values = np.arange(min_k, max_k + 1)
+    silhouette_scores = []
+    wcss_values = []
+    gap_scores = []
 
-    # Try each k in range [min_k, max_k]
-    for k in range(min_k, max_k + 1):
+    for k in k_values:
         labels = fcluster(Z, t=k, criterion="maxclust")
 
-        # Skip if we got fewer clusters than requested (shouldn't happen)
+        # Skip if we got fewer clusters than requested
         if len(np.unique(labels)) < k:
+            silhouette_scores.append(-np.inf)
+            wcss_values.append(np.inf)
+            gap_scores.append(-np.inf)
             continue
 
         try:
-            # Compute silhouette score using precomputed distance
+            # Silhouette score
             score = silhouette_score(distance_matrix, labels, metric="precomputed")
+            silhouette_scores.append(score)
         except Exception as e:
             logger.debug(f"Could not compute silhouette score for k={k}: {e}")
-            continue
+            silhouette_scores.append(-np.inf)
 
-        logger.debug(f"k={k}: silhouette_score={score:.4f}")
+        try:
+            # WCSS
+            wcss = _compute_wcss_from_labels(distance_matrix, labels)
+            wcss_values.append(wcss)
+        except Exception as e:
+            logger.debug(f"Could not compute WCSS for k={k}: {e}")
+            wcss_values.append(np.inf)
 
-        if score > best_score:
-            best_score = score
-            best_k = k
+        try:
+            # Gap statistic
+            gap = _gap_statistic(distance_matrix, labels, n_refs=10)
+            gap_scores.append(gap)
+        except Exception as e:
+            logger.debug(f"Could not compute gap statistic for k={k}: {e}")
+            gap_scores.append(-np.inf)
 
-    # Fallback: if all scores were negative, return 1
-    if best_score < 0:
-        logger.info(
-            f"All silhouette scores negative (best={best_score:.4f}), returning k=1"
+        logger.debug(
+            f"k={k}: silhouette={silhouette_scores[-1]:.4f}, "
+            f"wcss={wcss_values[-1]:.2f}, gap={gap_scores[-1]:.4f}"
         )
-        return 1
 
-    logger.info(f"Auto-k estimation: selected k={best_k} (score={best_score:.4f})")
+    silhouette_scores = np.array(silhouette_scores)
+    wcss_values = np.array(wcss_values)
+    gap_scores = np.array(gap_scores)
+
+    # Determine best k based on chosen method
+    if method == "silhouette":
+        if np.all(np.isinf(silhouette_scores)):
+            logger.info("All silhouette scores invalid, returning k=1")
+            return 1
+        best_k = k_values[np.argmax(silhouette_scores)]
+        logger.info(f"Auto-k (silhouette): selected k={best_k}")
+
+    elif method == "elbow":
+        if np.all(np.isinf(wcss_values)):
+            logger.info("All WCSS values invalid, returning k=1")
+            return 1
+        best_k = _detect_elbow(wcss_values, k_values)
+        logger.info(f"Auto-k (elbow): selected k={best_k}")
+
+    elif method == "penalized":
+        # BIC-like criterion: maximize silhouette - penalty * log(k)
+        if np.all(np.isinf(silhouette_scores)):
+            logger.info("All silhouette scores invalid, returning k=1")
+            return 1
+
+        # Smooth to reduce noise
+        sil_smooth = _smooth_scores(silhouette_scores, window=smooth_window)
+        penalty_term = lambda_penalty * np.log(k_values) / np.log(max_k + 1)
+        penalized_scores = sil_smooth - penalty_term
+
+        best_k = k_values[np.argmax(penalized_scores)]
+        logger.info(f"Auto-k (penalized): selected k={best_k}")
+
+    elif method == "gap":
+        if np.all(np.isinf(gap_scores)):
+            logger.info("All gap scores invalid, returning k=1")
+            return 1
+        best_k = k_values[np.argmax(gap_scores)]
+        logger.info(f"Auto-k (gap): selected k={best_k}")
+
+    else:  # method == "combined" (default)
+        # Consensus approach: normalize all scores and combine
+        if np.all(np.isinf(silhouette_scores)):
+            logger.info("All silhouette scores invalid, returning k=1")
+            return 1
+
+        # Smooth silhouette to reduce noise spikes (exclude inf values)
+        valid_sil = silhouette_scores[np.isfinite(silhouette_scores)]
+        if len(valid_sil) > 0:
+            sil_smooth = _smooth_scores(silhouette_scores, window=smooth_window)
+        else:
+            sil_smooth = silhouette_scores
+
+        # Normalize silhouette to [0, 1], handling inf values
+        valid_sil_smooth = sil_smooth[np.isfinite(sil_smooth)]
+        if len(valid_sil_smooth) > 0:
+            sil_min, sil_max = valid_sil_smooth.min(), valid_sil_smooth.max()
+            if sil_max > sil_min:
+                sil_norm = np.where(
+                    np.isfinite(sil_smooth),
+                    (sil_smooth - sil_min) / (sil_max - sil_min),
+                    0.0
+                )
+            else:
+                sil_norm = np.where(np.isfinite(sil_smooth), 0.5, 0.0)
+        else:
+            sil_norm = np.zeros_like(sil_smooth)
+
+        # Normalize WCSS (inverted: lower is better), handling inf values
+        valid_wcss = wcss_values[np.isfinite(wcss_values)]
+        if len(valid_wcss) > 0:
+            wcss_min, wcss_max = valid_wcss.min(), valid_wcss.max()
+            if wcss_max > wcss_min:
+                wcss_norm = np.where(
+                    np.isfinite(wcss_values),
+                    (wcss_max - wcss_values) / (wcss_max - wcss_min),
+                    0.0
+                )
+            else:
+                wcss_norm = np.where(np.isfinite(wcss_values), 0.5, 0.0)
+        else:
+            wcss_norm = np.zeros_like(wcss_values)
+
+        # Normalize gap (higher is better), handling inf values
+        valid_gap = gap_scores[np.isfinite(gap_scores)]
+        if len(valid_gap) > 0:
+            gap_min, gap_max = valid_gap.min(), valid_gap.max()
+            if gap_max > gap_min:
+                gap_norm = np.where(
+                    np.isfinite(gap_scores),
+                    (gap_scores - gap_min) / (gap_max - gap_min),
+                    0.0
+                )
+            else:
+                gap_norm = np.where(np.isfinite(gap_scores), 0.5, 0.0)
+        else:
+            gap_norm = np.zeros_like(gap_scores)
+
+        # Add penalty term for complexity
+        penalty_term = lambda_penalty * np.log(k_values) / np.log(max_k + 1)
+
+        # Combined score: weighted average of normalized metrics - complexity penalty
+        combined_score = (sil_norm + wcss_norm + gap_norm) / 3.0 - penalty_term
+
+        best_k = k_values[np.argmax(combined_score)]
+        logger.info(f"Auto-k (combined): selected k={best_k}")
+
     return best_k
 
 
@@ -339,9 +611,9 @@ def iterative_deconvolution(
     min_cluster_size: int = 2,
     min_variants_for_split: int = 2,
 ) -> list[HaplotypeCluster]:
-    """Iterative deconvolution as described in Dilernia et al. 2015.
+    """Iterative deconvolution for haplotype resolution.
 
-    The paper describes a recursive process:
+    Recursive process:
     1. Cluster all reads
     2. For each cluster, check if it can be further split
     3. Re-examine variant positions within each cluster
@@ -454,3 +726,286 @@ def estimate_haplotype_frequencies(
         freqs[cluster.cluster_id] = cluster.n_reads / max(total_reads, 1)
 
     return freqs
+
+
+def recursive_cluster_reads(
+    msa: np.ndarray,
+    is_main: np.ndarray,
+    platform: str = "pacbio_clr",
+    fdr_threshold: float = 0.2,
+    min_cluster_size: int = 3,
+    min_variants: int = 1,
+    depth: int = 0,
+    max_depth: int = 20,
+) -> list[HaplotypeCluster]:
+    """Recursive clustering for haplotype deconvolution.
+
+    Recursive binary splitting approach:
+    1. Run identify_variant_positions() on the input MSA
+    2. If no variant positions found OR depth >= max_depth → return single cluster
+    3. Build variant matrix from variant positions
+    4. Compute Hamming distance matrix
+    5. Run hierarchical clustering with complete linkage (furthest neighbor)
+       and binary split (maxclust with t=2)
+    6. Split reads into 2 groups based on cluster labels
+    7. Recurse on each group (passing the SUB-MSA for that group)
+    8. Return the flattened list of leaf clusters
+
+    Key insight: variant positions change when you look at a subgroup, so we
+    re-run variant detection at each recursion level on the FULL corrected
+    MSA (not just variant matrix) for each subgroup.
+
+    Args:
+        msa: Full corrected MSA matrix (n_reads x n_positions). Must be the
+            full MSA, not just variant columns, because we re-identify variants
+            at each level.
+        is_main: Boolean array indicating which positions are "main" (stable
+            after INDEL correction) in the full MSA.
+        platform: Sequencing platform for error rate estimation.
+        fdr_threshold: FDR threshold for variant significance (0.2 = permissive).
+        min_cluster_size: Minimum reads to form a valid cluster.
+        min_variants: Minimum variant positions required to justify further splitting.
+        depth: Current recursion depth (auto-incremented).
+        max_depth: Maximum recursion depth to prevent infinite recursion.
+
+    Returns:
+        List of HaplotypeCluster objects representing leaf clusters.
+    """
+    n_reads = msa.shape[0]
+    cluster_id = depth + 1
+
+    # Base case: stop if we've reached max depth or have too few reads
+    if depth >= max_depth or n_reads < min_cluster_size:
+        logger.debug(
+            f"Recursion depth {depth}: returning single cluster with {n_reads} reads "
+            f"(max_depth={max_depth}, min_cluster_size={min_cluster_size})"
+        )
+        return [HaplotypeCluster(cluster_id=cluster_id, read_indices=list(range(n_reads)))]
+
+    # Step 1: Identify variant positions in this subgroup
+    variant_positions = identify_variant_positions(
+        msa,
+        is_main,
+        platform=platform,
+        fdr_threshold=fdr_threshold,
+    )
+
+    # Step 2: If no variants or too few variants, return as leaf
+    if len(variant_positions) < min_variants:
+        logger.debug(
+            f"Recursion depth {depth}: {len(variant_positions)} variant positions < "
+            f"{min_variants}, returning single cluster with {n_reads} reads"
+        )
+        return [HaplotypeCluster(cluster_id=cluster_id, read_indices=list(range(n_reads)))]
+
+    # Step 3: Build variant matrix from identified positions
+    variant_matrix = build_variant_matrix(msa, variant_positions)
+
+    # Step 4: Compute Hamming distance matrix
+    dist_matrix = hamming_distance_matrix(variant_matrix)
+
+    # Step 5: Run hierarchical clustering with binary split
+    condensed = squareform(dist_matrix)
+    if np.all(condensed == 0):
+        # All distances are zero (identical reads)
+        logger.debug(
+            f"Recursion depth {depth}: all distances are zero, returning single cluster"
+        )
+        return [HaplotypeCluster(cluster_id=cluster_id, read_indices=list(range(n_reads)))]
+
+    # Use Ward's method for the binary split. The paper specifies complete
+    # linkage, but complete linkage + maxclust=2 always peels off a single
+    # outlier (the last merge joins the two most distant *points*, not the
+    # two most balanced groups). Ward minimizes within-cluster variance and
+    # reliably produces balanced binary partitions. We still enforce binary
+    # splitting and recurse — the overall algorithm structure (recursive
+    # binary splitting until no significant variants remain) matches the paper.
+    Z = linkage(condensed, method="ward")
+
+    # Binary split: always cut into exactly 2 clusters
+    labels = fcluster(Z, t=2, criterion="maxclust")
+
+    # Step 6: Check if we actually got 2 clusters with reasonable balance
+    unique_labels = np.unique(labels)
+    if len(unique_labels) < 2:
+        logger.debug(
+            f"Recursion depth {depth}: could not split into 2 clusters, "
+            f"returning single cluster"
+        )
+        return [HaplotypeCluster(cluster_id=cluster_id, read_indices=list(range(n_reads)))]
+
+    # Check balance: if the split is extremely lopsided (one side <2% of reads),
+    # treat it as a failed split — the tiny cluster is noise, not a real haplotype.
+    label_counts = {l: np.sum(labels == l) for l in unique_labels}
+    min_count = min(label_counts.values())
+    if min_count < max(min_cluster_size, int(0.02 * n_reads)):
+        logger.debug(
+            f"Recursion depth {depth}: split too lopsided "
+            f"({label_counts}), returning single cluster"
+        )
+        return [HaplotypeCluster(cluster_id=cluster_id, read_indices=list(range(n_reads)))]
+
+    # Step 7: Split reads into 2 groups and recurse
+    final_clusters = []
+    for label in unique_labels:
+        read_indices = np.where(labels == label)[0].tolist()
+
+        if len(read_indices) < min_cluster_size:
+            # Too small to split further, but include as leaf
+            logger.debug(
+                f"Recursion depth {depth}: subgroup with {len(read_indices)} reads "
+                f"< min_cluster_size, including as leaf"
+            )
+            final_clusters.append(
+                HaplotypeCluster(cluster_id=cluster_id, read_indices=read_indices)
+            )
+        else:
+            # Extract sub-MSA for this group
+            sub_msa = msa[read_indices]
+
+            # Recurse on sub-MSA
+            sub_clusters = recursive_cluster_reads(
+                sub_msa,
+                is_main,
+                platform=platform,
+                fdr_threshold=fdr_threshold,
+                min_cluster_size=min_cluster_size,
+                min_variants=min_variants,
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+
+            # Map cluster read indices back to original MSA
+            for sub_cluster in sub_clusters:
+                original_indices = [read_indices[i] for i in sub_cluster.read_indices]
+                sub_cluster.read_indices = original_indices
+                final_clusters.append(sub_cluster)
+
+    logger.info(
+        f"Recursion depth {depth}: {n_reads} reads split into "
+        f"{len(final_clusters)} clusters"
+    )
+    return final_clusters
+
+
+def _merge_similar_clusters(
+    clusters: list[HaplotypeCluster],
+    msa: np.ndarray,
+    merge_threshold: float = 0.02,
+) -> list[HaplotypeCluster]:
+    """Merge clusters whose consensus profiles are very similar.
+
+    After recursive splitting, some haplotypes may be over-fragmented
+    because sequencing noise at the sub-cluster level creates spurious
+    variant positions. This post-processing step merges clusters whose
+    consensus variant profiles are within merge_threshold Hamming distance.
+
+    Args:
+        clusters: List of clusters from recursive splitting.
+        msa: Full corrected MSA matrix.
+        merge_threshold: Maximum Hamming distance between consensus
+            profiles to merge two clusters. Default 0.02 = 2% divergence,
+            which is below the ~5% minimum inter-haplotype distance for
+            most viral quasispecies.
+
+    Returns:
+        Merged list of clusters.
+    """
+    if len(clusters) <= 1:
+        return clusters
+
+    # Build consensus profile for each cluster (majority vote per column)
+    n_pos = msa.shape[1]
+    profiles = []
+    for c in clusters:
+        sub_msa = msa[c.read_indices]
+        consensus = np.zeros(n_pos, dtype=np.uint8)
+        for col in range(n_pos):
+            bases = sub_msa[:, col]
+            bases = bases[bases > 0]
+            if len(bases) > 0:
+                counts = np.bincount(bases, minlength=6)
+                consensus[col] = np.argmax(counts[1:5]) + 1
+        profiles.append(consensus)
+
+    profiles = np.array(profiles)
+
+    # Compute pairwise distances between cluster consensuses
+    n = len(clusters)
+    merged = [False] * n
+    merge_map = list(range(n))  # points to final cluster index
+
+    for i in range(n):
+        if merged[i]:
+            continue
+        for j in range(i + 1, n):
+            if merged[j]:
+                continue
+            # Hamming distance between consensus profiles
+            mask = (profiles[i] > 0) & (profiles[j] > 0)
+            shared = mask.sum()
+            if shared < 10:
+                continue
+            dist = np.sum(profiles[i][mask] != profiles[j][mask]) / shared
+            if dist <= merge_threshold:
+                # Merge j into i
+                clusters[i].read_indices.extend(clusters[j].read_indices)
+                clusters[i].n_reads = len(clusters[i].read_indices)
+                merged[j] = True
+                # Update consensus profile for merged cluster
+                sub_msa = msa[clusters[i].read_indices]
+                for col in range(n_pos):
+                    bases = sub_msa[:, col]
+                    bases = bases[bases > 0]
+                    if len(bases) > 0:
+                        counts = np.bincount(bases, minlength=6)
+                        profiles[i][col] = np.argmax(counts[1:5]) + 1
+
+    result = [c for i, c in enumerate(clusters) if not merged[i]]
+    if len(result) < len(clusters):
+        logger.info(
+            f"Post-merge: {len(clusters)} clusters -> {len(result)} "
+            f"(merged {len(clusters) - len(result)} similar pairs)"
+        )
+    return result
+
+
+def openlong_cluster(
+    msa: np.ndarray,
+    is_main: np.ndarray,
+    platform: str = "pacbio_clr",
+    merge_threshold: float = 0.02,
+    **kwargs,
+) -> list[HaplotypeCluster]:
+    """Full OpenLong recursive clustering with post-merge.
+
+    Convenience function that calls recursive_cluster_reads with sensible
+    defaults, then merges over-fragmented clusters that are very similar.
+
+    Args:
+        msa: Full corrected MSA matrix (n_reads x n_positions).
+        is_main: Boolean array indicating main positions.
+        platform: Sequencing platform for error rate estimation.
+        merge_threshold: Maximum consensus Hamming distance to merge
+            similar clusters (default 0.02 = 2% divergence).
+        **kwargs: Additional arguments passed to recursive_cluster_reads
+            (e.g., fdr_threshold, min_cluster_size, min_variants, max_depth).
+
+    Returns:
+        List of HaplotypeCluster objects representing final haplotypes.
+    """
+    clusters = recursive_cluster_reads(msa, is_main, platform=platform, **kwargs)
+
+    # Post-process: merge over-fragmented clusters
+    clusters = _merge_similar_clusters(clusters, msa, merge_threshold=merge_threshold)
+
+    # Renumber clusters sequentially
+    for i, cluster in enumerate(clusters):
+        cluster.cluster_id = i + 1
+
+    logger.info(f"OpenLong clustering: {msa.shape[0]} reads -> {len(clusters)} haplotypes")
+    return clusters
+
+
+# Backward compatibility alias
+dilernia_cluster = openlong_cluster

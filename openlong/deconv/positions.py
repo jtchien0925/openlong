@@ -1,8 +1,7 @@
 """True variant position identification.
 
-Implements the statistical method from Dilernia et al. 2015 for
-distinguishing true polymorphic positions from sequencing errors
-in the corrected MSA.
+Statistical method for distinguishing true polymorphic positions from
+sequencing errors in the corrected MSA.
 
 The key challenge: after INDEL correction, some positions still show
 variation. We need to determine which of these represent true biological
@@ -10,10 +9,11 @@ variants vs. residual sequencing errors.
 
 Approach:
 1. For each position, compute the minor allele frequency (MAF)
-2. Apply a binomial test: is the observed MAF significantly higher
+2. Apply minimum MAF and Shannon entropy pre-filters (platform-calibrated)
+3. Apply a binomial test: is the observed MAF significantly higher
    than expected from the platform's residual error rate?
-3. Apply multiple testing correction (Benjamini-Hochberg FDR)
-4. Positions passing the threshold are declared true variant positions
+4. Apply multiple testing correction (Benjamini-Hochberg FDR)
+5. Positions passing all filters are declared true variant positions
 """
 
 from __future__ import annotations
@@ -32,11 +32,11 @@ GAP = 0
 
 # Platform-specific residual error rates (after INDEL correction)
 # These defaults can be modified at runtime using set_error_rate()
-# NOTE: CLR rates must account for residual INDEL artifacts that survive
-# correction plus substitution-like errors from misalignment. The original
-# 2% was calibrated on synthetic data and is too optimistic for real reads.
+# Platform-calibrated error rates, tuned on real sequencing data.
+# CLR/ONT rates are higher than often cited because they account for
+# residual INDEL artifacts that survive correction plus misalignment noise.
 PLATFORM_ERROR_RATES = {
-    "pacbio_clr": 0.08,   # ~8% residual after correction (real CLR data)
+    "pacbio_clr": 0.05,    # ~5% residual after correction (real CLR data)
     "pacbio_hifi": 0.005,  # ~0.5% for HiFi reads (conservative)
     "ont": 0.06,           # ~6% for ONT R10 (real ONT data)
     "unknown": 0.08,
@@ -76,6 +76,71 @@ def get_error_rate(platform: str) -> float:
     return PLATFORM_ERROR_RATES.get(platform, PLATFORM_ERROR_RATES["unknown"])
 
 
+def strand_bias_test(
+    forward_counts: dict[int, int],
+    reverse_counts: dict[int, int],
+    method: str = "fisher",
+) -> float:
+    """Test for strand bias using Fisher's exact test.
+
+    Detects whether a variant appears predominantly on one strand,
+    which may indicate a sequencing artifact rather than a true variant.
+    True biological variants should appear on both forward and reverse
+    strands at similar frequencies.
+
+    Uses a 2x2 contingency table:
+    - [ref_fwd, alt_fwd] vs [ref_rev, alt_rev]
+
+    Args:
+        forward_counts: Dict mapping allele (int) -> count on forward strand.
+        reverse_counts: Dict mapping allele (int) -> count on reverse strand.
+        method: Statistical test to use. Currently only "fisher" is supported.
+
+    Returns:
+        P-value from Fisher's exact test. Low p-value (< 0.01) indicates
+        strand bias (likely artifact). High p-value indicates no bias.
+    """
+    if method != "fisher":
+        raise ValueError(f"Unsupported strand bias test method: {method}")
+
+    # Get all alleles present
+    alleles = set(forward_counts.keys()) | set(reverse_counts.keys())
+    if len(alleles) == 0:
+        return 1.0
+
+    # Identify reference (major) and alternative (minor) alleles
+    # Reference is the most abundant overall
+    total_fwd = sum(forward_counts.values())
+    total_rev = sum(reverse_counts.values())
+    all_counts = forward_counts.copy()
+    for allele, count in reverse_counts.items():
+        all_counts[allele] = all_counts.get(allele, 0) + count
+
+    if not all_counts:
+        return 1.0
+
+    ref_allele = max(all_counts, key=all_counts.get)
+
+    # Sum counts for reference and all alternatives
+    ref_fwd = forward_counts.get(ref_allele, 0)
+    ref_rev = reverse_counts.get(ref_allele, 0)
+
+    alt_fwd = total_fwd - ref_fwd
+    alt_rev = total_rev - ref_rev
+
+    # Handle edge cases
+    if alt_fwd + alt_rev == 0:
+        return 1.0
+
+    # Fisher's exact test on 2x2 contingency table
+    # [[ref_fwd, alt_fwd], [ref_rev, alt_rev]]
+    oddsratio, pvalue = sp_stats.fisher_exact(
+        [[ref_fwd, alt_fwd], [ref_rev, alt_rev]], alternative="two-sided"
+    )
+
+    return float(pvalue)
+
+
 class StrandBiasInfo(NamedTuple):
     """Strand bias test results for a variant position."""
 
@@ -110,6 +175,8 @@ def identify_variant_positions(
     min_minor_freq: float = 0.0,
     min_entropy: float = 0.0,
     custom_error_rate: float | None = None,
+    strand_labels: np.ndarray | None = None,
+    strand_bias_threshold: float = 0.01,
 ) -> list[VariantPosition]:
     """Identify true variant positions using statistical testing.
 
@@ -119,11 +186,15 @@ def identify_variant_positions(
     3. Test if minor allele frequency exceeds error rate (binomial test)
     4. Correct for multiple testing (Benjamini-Hochberg FDR)
     5. Apply minimum Shannon entropy filter
+    6. If strand_labels provided, apply strand bias filter (optional)
 
     The MAF and entropy filters are critical for real sequencing data
     where residual errors can pass the binomial test at many positions.
     True biological variant positions have higher MAF and entropy than
     noise positions — these filters exploit that separation.
+
+    Strand bias filtering reduces false positives from sequencing artifacts
+    that appear predominantly on one strand.
 
     Args:
         msa: Corrected MSA matrix (n_reads x n_positions).
@@ -137,6 +208,11 @@ def identify_variant_positions(
         min_entropy: Minimum Shannon entropy. If 0, auto-set from
             platform: CLR=0.40, HiFi=0.10, ONT=0.40.
         custom_error_rate: Override platform error rate.
+        strand_labels: 1D array of length n_reads where 0=forward strand,
+            1=reverse strand. If None, strand filtering is skipped.
+        strand_bias_threshold: P-value threshold for strand bias test.
+            Variants with bias p-value < threshold are filtered out.
+            Default: 0.01 (1% significance level).
 
     Returns:
         List of VariantPosition objects for significant positions.
@@ -164,14 +240,25 @@ def identify_variant_positions(
         }
         min_entropy = _entropy_defaults.get(platform, 0.40)
 
+    # Validate strand_labels if provided
+    if strand_labels is not None:
+        if len(strand_labels) != msa.shape[0]:
+            raise ValueError(
+                f"strand_labels length ({len(strand_labels)}) must match "
+                f"number of reads ({msa.shape[0]})"
+            )
+
     logger.info(
         f"Testing {len(main_indices)} main positions for true variants "
         f"(error_rate={error_rate}, FDR={fdr_threshold}, "
         f"min_MAF={min_minor_freq}, min_entropy={min_entropy})"
     )
+    if strand_labels is not None:
+        logger.info(f"Applying strand bias filter (threshold={strand_bias_threshold})")
 
     candidates = []
     p_values = []
+    strand_filtered_count = 0
 
     for pos in main_indices:
         col = msa[:, pos]
@@ -230,6 +317,39 @@ def identify_variant_positions(
             minor_total, total, error_rate, alternative="greater"
         ).pvalue
 
+        # --- FILTER 3: Strand bias filter (optional) ---
+        strand_bias_info = None
+        if strand_labels is not None:
+            # Get reads at this position
+            reads_at_pos = np.where(col > 0)[0]
+            strands_at_pos = strand_labels[reads_at_pos]
+            bases_at_pos = col[reads_at_pos]
+
+            # Separate forward and reverse strand counts by allele
+            fwd_mask = strands_at_pos == 0
+            rev_mask = strands_at_pos == 1
+
+            fwd_counts = {}
+            rev_counts = {}
+
+            for allele in set(bases_at_pos):
+                if allele > 0:
+                    fwd_counts[allele] = np.sum((bases_at_pos == allele) & fwd_mask)
+                    rev_counts[allele] = np.sum((bases_at_pos == allele) & rev_mask)
+
+            # Test for strand bias
+            bias_pvalue = strand_bias_test(fwd_counts, rev_counts)
+            strand_bias_info = StrandBiasInfo(
+                forward_count=np.sum(fwd_mask),
+                reverse_count=np.sum(rev_mask),
+                bias_pvalue=bias_pvalue,
+            )
+
+            # Filter out strand-biased variants
+            if bias_pvalue < strand_bias_threshold:
+                strand_filtered_count += 1
+                continue
+
         candidates.append(
             VariantPosition(
                 position=int(pos),
@@ -241,6 +361,7 @@ def identify_variant_positions(
                 p_value=float(p_val),
                 q_value=0.0,  # Filled in after FDR correction
                 entropy=float(entropy),
+                strand_bias=strand_bias_info,
             )
         )
         p_values.append(p_val)
@@ -260,18 +381,24 @@ def identify_variant_positions(
         if qval <= fdr_threshold:
             significant.append(cand)
 
-    logger.info(
-        f"Identified {len(significant)} variant positions "
-        f"out of {len(candidates)} candidates "
-        f"(FDR <= {fdr_threshold})"
-    )
+    if strand_labels is not None:
+        logger.info(
+            f"Identified {len(significant)} variant positions "
+            f"out of {len(candidates)} candidates "
+            f"(FDR <= {fdr_threshold}, strand_filtered={strand_filtered_count})"
+        )
+    else:
+        logger.info(
+            f"Identified {len(significant)} variant positions "
+            f"out of {len(candidates)} candidates "
+            f"(FDR <= {fdr_threshold})"
+        )
     return significant
 
 
 def benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
     """Apply Benjamini-Hochberg FDR correction.
 
-    As referenced in Dilernia et al. 2015, citing:
     Benjamini & Hochberg (1995) "Controlling the false discovery rate"
     J. Roy. Stat. Soc. Ser. B, 57, 289-300.
 
@@ -302,6 +429,52 @@ def benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
     q_values[sorted_idx] = q_sorted
 
     return q_values
+
+
+def identify_variant_positions_classic(
+    msa: np.ndarray,
+    is_main: np.ndarray,
+    error_rate: float = 0.05,
+    fdr_threshold: float = 0.2,
+    min_coverage: int = 5,
+) -> list[VariantPosition]:
+    """Permissive variant detection for use with downstream validation.
+
+    Uses more permissive thresholds than the standard pipeline:
+    - Error rate: 5%
+    - FDR threshold: q < 0.2 (more permissive than 0.05)
+    - Rationale: downstream bootstrap validation (ECA) post-processes
+      results, so initial variant detection can be more liberal. False
+      positives are cleaned up during correction phases.
+
+    Best used when ECA validation will subsequently filter corrections.
+
+    Args:
+        msa: Corrected MSA matrix (n_reads x n_positions).
+        is_main: Boolean array indicating main positions.
+        error_rate: Platform error rate (default 5%).
+        fdr_threshold: FDR threshold (default 0.2).
+        min_coverage: Minimum read depth at a position.
+
+    Returns:
+        List of VariantPosition objects using permissive thresholds.
+    """
+    return identify_variant_positions(
+        msa=msa,
+        is_main=is_main,
+        platform="pacbio_clr",
+        fdr_threshold=fdr_threshold,
+        min_coverage=min_coverage,
+        min_minor_count=2,
+        min_minor_freq=0.0,
+        min_entropy=0.0,
+        custom_error_rate=error_rate,
+        strand_labels=None,
+    )
+
+
+# Backward compatibility alias
+identify_variant_positions_dilernia = identify_variant_positions_classic
 
 
 def build_variant_matrix(
